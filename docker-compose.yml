@@ -17,6 +17,9 @@ services:
       - GARAGE_DOOR_TIME_IN_MS=3000
       - DISPLAY_APP_V2=TRUE
       - KIOSK_QR_DELAY_IN_MS=3000
+      - ACCESS_STREAM_BASE_URL=http://0.0.0.0:4003
+      - ACCESS_STREAM_USERNAME=admin
+      - ACCESS_STREAM_PASSWORD=secret
     tty: true
     volumes:
       - app-data:/var/log/enable_backend
