@@ -1,0 +1,43 @@
+version: '3.2'
+services:
+  online:
+    image: enablebox/access-online:prod-76-rc1
+    container_name: access-online
+    environment:
+      - DB_HOST=0.0.0.0
+      - DB_NAME=access_online
+      - DB_USER=root
+      - DB_PASS=root
+      - DB_PORT=3306
+      - DOCKER_IMAGE=enablebox/access-online:prod-76-rc1
+      - CERT_PATH=/code/ca.crt
+      - ANPR_EXPIRY_TIME_IN_MS=30000
+      - EVENT_DELAY_IN_MS=5000
+      - BB_DELAY_IN_MS=2000      
+      - GARAGE_DOOR_TIME_IN_MS=3000
+      - DISPLAY_APP_V2=TRUE
+      - KIOSK_QR_DELAY_IN_MS=3000
+    tty: true
+    volumes:
+      - app-data:/var/log/enable_backend
+      - type: bind
+        source: "./server.crt"
+        target: "/code/server.crt"
+      - type: bind
+        source: "./ca.crt"
+        target: "/code/ca.crt"
+      - type: bind
+        source: "./docker-compose.yml"
+        target: "/code/docker-compose.yml"
+    command: ["./start.sh", "-c", "/code/server", "-p", "4000" ]
+    ports:
+        - "4000:4000"
+    restart: always
+    network_mode: "host"
+    logging:
+      driver: "json-file"
+      options:
+        max-file: "5"
+        max-size: "1g"
+volumes:
+  app-data:
