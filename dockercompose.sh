@@ -35,7 +35,7 @@ time_stamp=$(date +%Y-%m-%d-%T)
 
 if [ "$operation" = "docker_compose_update" ]
 then
-  cd /home/getmyparking/Documents/workspace
+  cd BASE_PATH
   echo "current path"
   pwd
   SS=$running_docker_image
@@ -50,7 +50,7 @@ fi
 
 if [ "$operation" = "docker_container_restart" ]
 then
-  cd /home/getmyparking/Documents/workspace
+  cd BASE_PATH
   echo "current path"
   pwd
   echo "stopping old docker image"
