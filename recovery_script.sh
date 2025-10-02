@@ -14,7 +14,7 @@ if ps ax | grep -v grep | grep -v $0 | grep $SERVICE_BG > /dev/null
 	    then
 	      restart_container=$(sudo docker container restart "$docker_id")
 	    else
-	      sudo docker-compose -f /home/getmyparking/Documents/workspace/docker-compose.yml up -d> /dev/null
+	      sudo docker-compose -f BASE_PATH/docker-compose.yml up -d> /dev/null
 	    fi
 fi
 
@@ -30,6 +30,6 @@ if ps ax | grep -v grep | grep -v $0 | grep $SERVICE > /dev/null
 	    	then
 	      	  restart_container=$(sudo docker container restart "$docker_id")
 	    	else
-	      	  sudo docker-compose -f /home/getmyparking/Documents/workspace/docker-compose.yml up -d> /dev/null
+	      	  sudo docker-compose -f BASE_PATH/docker-compose.yml up -d> /dev/null
 	    	fi
 fi
