@@ -12,9 +12,9 @@ user = ""
 password = ""
 parking = 1
 
-tenant = "nexus"
-company_id = "166"
-parking_id = "3340"
+tenant = "tenant_name"
+company_id = "company_id"
+parking_id = "parking_id"
 
 t_prefix = tenant + "/" + company_id + "/"  + parking_id
 
