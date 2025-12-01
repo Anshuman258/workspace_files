@@ -2,7 +2,7 @@ version: '3.2'
 
 services:
   online:
-    image: enablebox/access-online:prod-77-rc2
+    image: enablebox/access-online:prod-78-rc1
     container_name: access-online
     environment:
       - DB_HOST=0.0.0.0
@@ -10,7 +10,7 @@ services:
       - DB_USER=root
       - DB_PASS=root
       - DB_PORT=3306
-      - DOCKER_IMAGE=enablebox/access-online:prod-77-rc2
+      - DOCKER_IMAGE=enablebox/access-online:prod-78-rc1
       - CERT_PATH=/code/ca.crt
       - ANPR_EXPIRY_TIME_IN_MS=30000
       - EVENT_DELAY_IN_MS=5000
