@@ -1,7 +1,7 @@
 #!/bin/bash
 SERVICE_BG="process_tasks"
 SERVICE="runserver"
-IMAGE_NAME="ancestor=enablebox/access-online:prod-76-rc1"
+IMAGE_NAME="ancestor=enablebox/access-online:prod-78-rc1"
 sleep 5m 
 if ps ax | grep -v grep | grep -v $0 | grep $SERVICE_BG > /dev/null
 	then
