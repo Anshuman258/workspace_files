@@ -21,6 +21,7 @@ services:
       - ACCESS_STREAM_BASE_URL=http://0.0.0.0:4003
       - ACCESS_STREAM_USERNAME=admin
       - ACCESS_STREAM_PASSWORD=secret
+      - SKIP_CAMERA_AUTH=FALSE
     tty: true
     volumes:
       - app-data:/var/log/enable_backend
