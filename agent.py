@@ -1,5 +1,5 @@
 """
-GMP Agent — Merged MQTT listener + DB Setup + DB Get.
+GMP Agent — Merged MQTT listener + DB Setup + DB Update.
 Listens on gmp/device/{MAC}/command for action payloads.
 When action = "db_setup", generates SQL from the JSON and
 executes it directly against the local MySQL database.
@@ -491,6 +491,429 @@ def handle_db_setup(client, response_topic, payload):
         )
     else:
         publish_response(client, response_topic, "db_setup", "failed", {}, error)
+# -------------------------------------------------------------------
+# DB Update Helpers
+# -------------------------------------------------------------------
+def _expected_hw_fields(row: dict, hw_type: str) -> dict:
+    """
+    Given a lane_controller_hardware JSON row and a hardware type,
+    returns a dict of the expected DB field values for that hardware device.
+    Used for diffing against current DB state.
+    """
+    name_map = {
+        'PRESENCE_LOOP': 'PL', 'SAFETY_LOOP': 'SL', 'BOOMBARRIER': 'BB',
+        'BOOMBARRIER_SENSOR_WAIT': 'BSW', 'CERRADA_LPR': 'LPR',
+        'POS': 'POS', 'KIOSK_APP': 'KIOSK'
+    }
+    hw_name = f"{row['controller_device_name']}_{name_map.get(hw_type, 'HW')}"
+    rest_endpoint = (
+        f"http://{row['controller_ip']}/do_value/slot_0"
+        if hw_type == 'BOOMBARRIER'
+        else f"http://{row['controller_ip']}/di_value/slot_0"
+    )
+    if hw_type in ['PRESENCE_LOOP', 'SAFETY_LOOP', 'BOOMBARRIER_SENSOR_WAIT']:
+        access_url = f"Advantech/{row['controller_mac']}/data"
+    elif hw_type == 'BOOMBARRIER':
+        access_url = f"Advantech/{row['controller_mac']}/ctl/do{row['boom_barrier_pin']}"
+    elif hw_type == 'CERRADA_LPR':
+        access_url = row['camera_ip']
+    elif hw_type in ['POS', 'KIOSK_APP']:
+        access_url = row['pos_ip']
+    else:
+        access_url = ''
+    if hw_type == 'PRESENCE_LOOP':
+        pin = str(row['presence_loop_pin'])
+    elif hw_type == 'SAFETY_LOOP':
+        pin = str(row['safety_loop_pin'])
+    elif hw_type == 'BOOMBARRIER_SENSOR_WAIT':
+        pin = str(row['boombarrier_sensor_pin'])
+    elif hw_type == 'BOOMBARRIER':
+        pin = str(row['boom_barrier_pin'])
+    else:
+        pin = ''
+    return {
+        'hardware_device_name':         hw_name,
+        'rest_endpoint':                rest_endpoint,
+        'device_access_url':            access_url,
+        'input_type':                   pin,
+        'rest_request_json_high_value': '{"DOVal": [{"Ch": 0,"Md": 0,"Val": 1}]}' if hw_type == 'BOOMBARRIER' else '',
+        'hardware_username':            'admin'  if hw_type == 'CERRADA_LPR' else '',
+        'hardware_password':            'secret' if hw_type == 'CERRADA_LPR' else '',
+    }
+def _build_hw_insert_sql(hw_id: int, hw_type: str, row: dict, lane_id: int) -> str:
+    """Generates a single INSERT INTO hardware_devices statement."""
+    f = _expected_hw_fields(row, hw_type)
+    conn_type = "'FTP'" if hw_type in ['CERRADA_LPR', 'POS'] else "'MQTT_SERVER'"
+    return (
+        f"INSERT INTO hardware_devices "
+        f"(hardware_device_id, connection_type, type, port, url, input_type, response_type, "
+        f"rest_endpoint, rest_request_json_high_value, device_access_url, max_connections_allowed, "
+        f"hardware_device_name, hardware_username, hardware_password, ftp_username, ftp_password, "
+        f"external_identifier, status, created_at, updated_at, controller_id, lane_id, is_stp) "
+        f"VALUES ({hw_id}, {conn_type}, '{hw_type}', '1883', '0.0.0.0', '{f['input_type']}', 'JSON', "
+        f"'{f['rest_endpoint']}', '{f['rest_request_json_high_value']}', '{f['device_access_url']}', "
+        f"1, '{f['hardware_device_name']}', '{f['hardware_username']}', '{f['hardware_password']}', "
+        f"'', '', '', 'ACTIVE', now(), now(), {row['controller_id']}, {lane_id}, 1);"
+    )
+def _normalize_db_val(val):
+    """
+    Normalizes a DB value for safe comparison with JSON values.
+    Handles: timedelta → int (total_seconds), Decimal → int/float, None → ''.
+    """
+    import datetime
+    import decimal
+    if val is None:
+        return ''
+    if isinstance(val, datetime.timedelta):
+        return int(val.total_seconds())
+    if isinstance(val, decimal.Decimal):
+        return int(val) if val == int(val) else float(val)
+    if isinstance(val, float):
+        return int(val) if val == int(val) else val
+    return val
+# -------------------------------------------------------------------
+# DB Update Handler
+# -------------------------------------------------------------------
+def handle_db_update(client, response_topic, payload):
+    """
+    Diffs the incoming JSON against current DB state and applies only
+    the SQL needed for what actually changed. Handles:
+      1.1  enable_config field changes
+      2.1  Controller field changes (ip, credentials, name)
+      2.2  New controller added
+      2.3  Controller removed
+      2.4  Lane field changes (loop_logic, intervals, lane_type, etc.)
+      2.5  New lane added
+      2.6  Lane removed (deletes hw_devices first)
+      2.7  Hardware device field changes (pins, camera_ip, pos_ip, mac)
+      2.8  New hardware type added to existing lane
+      2.9  Hardware type removed from existing lane
+      2.10 controller_device_name change → hw_device_name update
+      2.11 Lane reassigned to different controller
+      2.12 Same controller across multiple lanes → update once
+      2.13 controller_mac change → device_access_url in hw rows
+      2.14 boom_barrier_pin change → input_type + device_access_url
+      2.15 camera_ip change → CERRADA_LPR device_access_url
+      2.16 pos_ip change → POS/KIOSK_APP device_access_url
+      2.17 hardware_type string completely replaced
+      3.1  analytics_config field changes
+      3.2  kiosk_config field changes
+      4.1  No changes detected → respond with no_change
+      4.2  Empty lane_controller_hardware → delete all lanes
+      4.3  Missing section in JSON → skip that section
+      4.6  lane_type change → prefix recalculated
+      5.1  Controller delete order respects FK constraints
+    """
+    logger.info("Executing: db_update")
+    db_json = payload.get("data")
+    if not db_json:
+        publish_response(client, response_topic, "db_update", "failed", {},
+                         "No 'data' key found in payload")
+        return
+    try:
+        conn = get_db_connection()
+        sql_statements = []
+        stats = {"inserted": 0, "updated": 0, "deleted": 0}
+        with conn.cursor() as cursor:
+            # === VALIDATION: Single-row table guard ===
+            for table in ['enable_config', 'online_config', 'analytics_config', 'kiosk_config']:
+                cursor.execute(f"SELECT COUNT(*) as cnt FROM `{table}`")
+                count = cursor.fetchone()['cnt']
+                if count > 1:
+                    publish_response(client, response_topic, "db_update", "failed", {},
+                                     f"Table '{table}' has {count} rows — expected exactly 1. Aborting.")
+                    conn.close()
+                    return
+                if count == 0:
+                    logger.warning(f"Table '{table}' is empty — skipping update for it.")
+            # === FETCH CURRENT DB STATE ===
+            cursor.execute("SELECT * FROM enable_config LIMIT 1")
+            cur_enable = cursor.fetchone()
+            cursor.execute("SELECT * FROM enable_controllers")
+            cur_controllers = {row['controller_id']: row for row in cursor.fetchall()}
+            # Lane keyed by cloud_lane_id for diffing, also keep id (= controller_id used as lane pk)
+            cursor.execute("SELECT * FROM lanes")
+            cur_lanes = {row['cloud_lane_id']: row for row in cursor.fetchall()}
+            # Hardware keyed by lane_id → type
+            cursor.execute("SELECT * FROM hardware_devices ORDER BY hardware_device_id")
+            cur_hw_by_lane = {}
+            for hw in cursor.fetchall():
+                cur_hw_by_lane.setdefault(hw['lane_id'], {})[hw['type']] = hw
+            cursor.execute("SELECT * FROM analytics_config LIMIT 1")
+            cur_analytics = cursor.fetchone()
+            cursor.execute("SELECT * FROM kiosk_config LIMIT 1")
+            cur_kiosk = cursor.fetchone()
+            cursor.execute("SELECT COALESCE(MAX(hardware_device_id), 0) as max_id FROM hardware_devices")
+            hw_id_counter = cursor.fetchone()['max_id'] + 1
+        conn.close()
+        # ================================================================
+        # 1. enable_online_config → enable_config (single row)
+        # ================================================================
+        if 'enable_online_config' in db_json and cur_enable:
+            new_ec = db_json['enable_online_config']
+            field_map = {                  # json_key         : db_col
+                'cloud_parking_id':                 'cloud_parking_id',
+                'cloud_company_id':                 'cloud_company_id',
+                'cloud_location_id':                'cloud_location_id',
+                'company_name':                     'company_name',
+                'tenant_name':                      'tenant_name',
+                'parking_name':                     'parking_name',
+                'nuc_device_name':                  'nuc_device_name',
+                'timezone':                         'timezone',
+                'geohash':                          'geo_hash',
+                'country_code':                     'country_code',
+                'parking_system_name':              'parking_system_name',
+                'attach_not_found_lpr':             'attach_not_found_lpr',
+                'open_barrier_on_sl_untrigger':     'open_barrier_on_sl_untrigger',
+                'boom_barrier_async_trigger':       'boom_barrier_async_trigger',
+                'analytics_enabled':                'analytics_enabled',
+                'levenshtein_for_duplicate_check':  'levenshtein_for_duplicate_check',
+                'place_of_issue_source':            'place_of_issue_source',
+                'duplicate_request_expiry_time_sec':'duplicate_request_expiry_time_sec',
+                'lane_logic_version':               'lane_logic_version',
+                'tag_lp_to_image_enabled':          'tag_lp_to_image_enabled',
+            }
+            set_clauses = []
+            for json_key, db_col in field_map.items():
+                db_val = _normalize_db_val(cur_enable.get(db_col, ''))
+                if json_key in new_ec and str(new_ec[json_key]) != str(db_val):
+                    val = new_ec[json_key]
+                    set_clauses.append(f"{db_col} = '{val}'" if isinstance(val, str) else f"{db_col} = {val}")
+            if set_clauses:
+                set_clauses.append("updated_at = now()")
+                sql_statements.append(
+                    f"UPDATE enable_config SET {', '.join(set_clauses)} "
+                    f"WHERE cloud_parking_id = {cur_enable['cloud_parking_id']};"
+                )
+                stats['updated'] += 1
+                logger.info(f"[db_update] enable_config: {len(set_clauses)-1} field(s) changed")
+        # ================================================================
+        # 2. lane_controller_hardware → enable_controllers + lanes + hw
+        # ================================================================
+        if 'lane_controller_hardware' in db_json:
+            new_rows = db_json['lane_controller_hardware']
+            # Build new-state indexes (case 2.12: controller seen once only)
+            new_controllers = {}        # controller_id → first row that defines it
+            new_lanes = {}              # cloud_lane_id → row
+            for row in new_rows:
+                if row['controller_id'] not in new_controllers:
+                    new_controllers[row['controller_id']] = row
+                new_lanes[row['cloud_lane_id']] = row
+            cur_ctrl_ids  = set(cur_controllers.keys())
+            new_ctrl_ids  = set(new_controllers.keys())
+            cur_lane_ids  = set(cur_lanes.keys())
+            new_lane_ids  = set(new_lanes.keys())
+            # ---- INSERT new controllers first (lanes depend on them) ----
+            for cid in new_ctrl_ids - cur_ctrl_ids:
+                row = new_controllers[cid]
+                hk  = base64.b64encode(f"{row['MQTT_user']}:{row['MQTT_password']}".encode()).decode()
+                sql_statements.append(
+                    f"INSERT INTO enable_controllers "
+                    f"(controller_id, controller_name, header_key, ip, mqtt_port, MQTT_user, MQTT_password, "
+                    f"response_type, firmware_version, controller_device_name, controller_state, "
+                    f"timer_bw_pin_high_low, is_wise, created_at, updated_at, is_lane_independent_controller) "
+                    f"VALUES ({cid}, '{row['controller_name']}', '{hk}', '{row['controller_ip']}', "
+                    f"1883, '{row['MQTT_user']}', '{row['MQTT_password']}', 'JSON', 'A1.16 B02', "
+                    f"'{row['controller_device_name']}', 'ACTIVE', 2, 1, now(), now(), 0);"
+                )
+                stats['inserted'] += 1
+                logger.info(f"[db_update] INSERT controller_id={cid}")
+            # ---- UPDATE existing controllers if fields changed ----
+            for cid in cur_ctrl_ids & new_ctrl_ids:
+                new_row = new_controllers[cid]
+                cur_row = cur_controllers[cid]
+                set_clauses = []
+                if new_row['controller_name'] != str(cur_row.get('controller_name', '')):
+                    set_clauses.append(f"controller_name = '{new_row['controller_name']}'")
+                if new_row['controller_ip'] != str(cur_row.get('ip', '')):
+                    set_clauses.append(f"ip = '{new_row['controller_ip']}'")
+                if new_row['controller_device_name'] != str(cur_row.get('controller_device_name', '')):
+                    set_clauses.append(f"controller_device_name = '{new_row['controller_device_name']}'")
+                # Credentials changed → also regenerate header_key
+                if (new_row['MQTT_user'] != str(cur_row.get('MQTT_user', '')) or
+                        new_row['MQTT_password'] != str(cur_row.get('MQTT_password', ''))):
+                    hk = base64.b64encode(f"{new_row['MQTT_user']}:{new_row['MQTT_password']}".encode()).decode()
+                    set_clauses += [
+                        f"MQTT_user = '{new_row['MQTT_user']}'",
+                        f"MQTT_password = '{new_row['MQTT_password']}'",
+                        f"header_key = '{hk}'",
+                    ]
+                if set_clauses:
+                    set_clauses.append("updated_at = now()")
+                    sql_statements.append(
+                        f"UPDATE enable_controllers SET {', '.join(set_clauses)} WHERE controller_id = {cid};"
+                    )
+                    stats['updated'] += 1
+                    logger.info(f"[db_update] UPDATE controller_id={cid}: {set_clauses}")
+            # ---- INSERT new lanes ----
+            for clid in new_lane_ids - cur_lane_ids:
+                row    = new_lanes[clid]
+                prefix = f"{row['lane_type']}_{clid}"
+                lane_id = row['controller_id']
+                sql_statements.append(
+                    f"INSERT INTO lanes "
+                    f"(id, cloud_lane_id, vehicle_type, prefix, loop_logic, loop1_interval, loop2_interval, "
+                    f"boom_barrier_interval, is_boombarrier_active, is_ticket_dispenser_active, "
+                    f"ticket_dispenser_suppressed_value_true, lane_type, timer_bw_loops, online_media_type, "
+                    f"created_at, updated_at, lane_state, lane_name, max_time_between_loops, "
+                    f"is_deep_health_check, controller_id, pos_reset_trigger, pos_trigger_enabled, "
+                    f"is_lane_disabled, lane_pair_id, bb_sensor_wait_timeout, capture_lp_seconds) "
+                    f"VALUES ({lane_id}, {clid}, 'CAR', '{prefix}', '{row['loop_logic']}', "
+                    f"{row['loop1_interval']}, {row['loop2_interval']}, {row['boom_barrier_interval']}, "
+                    f"{row['is_boombarrier_active']}, 0, 1, '{row['lane_type']}', 0, 'LPR', now(), now(), "
+                    f"'ACTIVE', '{row['controller_device_name']}', 0, 0, {row['controller_id']}, "
+                    f"{row.get('pos_reset_trigger', 0)}, {row.get('pos_trigger_enabled', 0)}, "
+                    f"0, NULL, 30, 5);"
+                )
+                stats['inserted'] += 1
+                logger.info(f"[db_update] INSERT lane cloud_lane_id={clid}")
+                for hw_type in [h.strip() for h in row['hardware_type'].split(',')]:
+                    sql_statements.append(_build_hw_insert_sql(hw_id_counter, hw_type, row, lane_id))
+                    hw_id_counter += 1
+                    stats['inserted'] += 1
+            # ---- UPDATE existing lanes (and their hardware) ----
+            for clid in cur_lane_ids & new_lane_ids:
+                new_row = new_lanes[clid]
+                cur_row = cur_lanes[clid]
+                lane_id = cur_row['id']     # PK of lanes (= controller_id at insert time)
+                set_clauses = []
+                # Case 2.4: basic lane fields
+                lane_field_map = [
+                    ('loop_logic',          'loop_logic',          str),
+                    ('loop1_interval',      'loop1_interval',      int),
+                    ('loop2_interval',      'loop2_interval',      int),
+                    ('boom_barrier_interval','boom_barrier_interval',int),
+                    ('is_boombarrier_active','is_boombarrier_active',int),
+                    ('pos_reset_trigger',   'pos_reset_trigger',   int),
+                    ('pos_trigger_enabled', 'pos_trigger_enabled', int),
+                ]
+                for json_key, db_col, t in lane_field_map:
+                    nv = new_row.get(json_key)
+                    db_val = _normalize_db_val(cur_row.get(db_col, ''))
+                    if nv is not None and str(nv) != str(db_val):
+                        set_clauses.append(f"{db_col} = '{nv}'" if t == str else f"{db_col} = {nv}")
+                # Case 4.6: lane_type changed → recalculate prefix
+                if new_row['lane_type'] != str(cur_row.get('lane_type', '')):
+                    new_prefix = f"{new_row['lane_type']}_{clid}"
+                    set_clauses += [f"lane_type = '{new_row['lane_type']}'", f"prefix = '{new_prefix}'"]
+                # Case 2.10: controller_device_name → also updates lane_name
+                if new_row['controller_device_name'] != str(cur_row.get('lane_name', '')):
+                    set_clauses.append(f"lane_name = '{new_row['controller_device_name']}'")
+                # Case 2.11: lane reassigned to a different controller
+                if new_row['controller_id'] != cur_row.get('controller_id'):
+                    set_clauses.append(f"controller_id = {new_row['controller_id']}")
+                    sql_statements.append(
+                        f"UPDATE hardware_devices SET controller_id = {new_row['controller_id']} "
+                        f"WHERE lane_id = {lane_id};"
+                    )
+                    stats['updated'] += 1
+                if set_clauses:
+                    set_clauses.append("updated_at = now()")
+                    sql_statements.append(
+                        f"UPDATE lanes SET {', '.join(set_clauses)} WHERE cloud_lane_id = {clid};"
+                    )
+                    stats['updated'] += 1
+                    logger.info(f"[db_update] UPDATE lane cloud_lane_id={clid}: {set_clauses}")
+                # ---- Hardware diff for this lane ----
+                cur_hw  = cur_hw_by_lane.get(lane_id, {})
+                new_hw_types = set(h.strip() for h in new_row['hardware_type'].split(','))
+                cur_hw_types = set(cur_hw.keys())
+                # Case 2.9: hardware type removed
+                for hw_type in cur_hw_types - new_hw_types:
+                    sql_statements.append(
+                        f"DELETE FROM hardware_devices WHERE lane_id = {lane_id} AND type = '{hw_type}';"
+                    )
+                    stats['deleted'] += 1
+                    logger.info(f"[db_update] DELETE hw type={hw_type} lane_id={lane_id}")
+                # Case 2.8: hardware type added
+                for hw_type in new_hw_types - cur_hw_types:
+                    sql_statements.append(_build_hw_insert_sql(hw_id_counter, hw_type, new_row, lane_id))
+                    hw_id_counter += 1
+                    stats['inserted'] += 1
+                    logger.info(f"[db_update] INSERT hw type={hw_type} lane_id={lane_id}")
+                # Case 2.7/2.10/2.13/2.14/2.15/2.16: existing hw field changes
+                for hw_type in new_hw_types & cur_hw_types:
+                    expected = _expected_hw_fields(new_row, hw_type)
+                    cur_hw_row = cur_hw[hw_type]
+                    hw_set = []
+                    for db_col, new_val in expected.items():
+                        db_val = _normalize_db_val(cur_hw_row.get(db_col, ''))
+                        if str(new_val) != str(db_val):
+                            hw_set.append(f"{db_col} = '{new_val}'")
+                    if hw_set:
+                        hw_set.append("updated_at = now()")
+                        sql_statements.append(
+                            f"UPDATE hardware_devices SET {', '.join(hw_set)} "
+                            f"WHERE lane_id = {lane_id} AND type = '{hw_type}';"
+                        )
+                        stats['updated'] += 1
+                        logger.info(f"[db_update] UPDATE hw type={hw_type} lane_id={lane_id}: {hw_set}")
+            # ---- DELETE removed lanes (hw first, then lane) ----
+            for clid in cur_lane_ids - new_lane_ids:
+                lane_id = cur_lanes[clid]['id']
+                sql_statements.append(f"DELETE FROM hardware_devices WHERE lane_id = {lane_id};")
+                sql_statements.append(f"DELETE FROM lanes WHERE cloud_lane_id = {clid};")
+                stats['deleted'] += 2
+                logger.info(f"[db_update] DELETE lane cloud_lane_id={clid} (and its hw)")
+            # ---- DELETE removed controllers (after their lanes are gone) ----
+            for cid in cur_ctrl_ids - new_ctrl_ids:
+                sql_statements.append(f"DELETE FROM enable_controllers WHERE controller_id = {cid};")
+                stats['deleted'] += 1
+                logger.info(f"[db_update] DELETE controller_id={cid}")
+        # ================================================================
+        # 3. analytics_config — single row UPDATE
+        # ================================================================
+        if 'analytics_config' in db_json and cur_analytics:
+            new_a = db_json['analytics_config']
+            set_clauses = []
+            for field in ['mqtt_broker_address', 'mqtt_port', 'mqtt_user', 'mqtt_password']:
+                db_val = _normalize_db_val(cur_analytics.get(field, ''))
+                if str(new_a.get(field, '')) != str(db_val):
+                    val = new_a[field]
+                    set_clauses.append(f"{field} = '{val}'" if isinstance(val, str) else f"{field} = {val}")
+            if set_clauses:
+                sql_statements.append(f"UPDATE analytics_config SET {', '.join(set_clauses)};")
+                stats['updated'] += 1
+                logger.info(f"[db_update] analytics_config: {len(set_clauses)} field(s) changed")
+        # ================================================================
+        # 4. kiosk_config — single row UPDATE
+        # ================================================================
+        if 'kiosk_config' in db_json and cur_kiosk:
+            new_k = db_json['kiosk_config']
+            set_clauses = []
+            for field in ['mqtt_broker_address', 'mqtt_port', 'mqtt_user', 'mqtt_password']:
+                db_val = _normalize_db_val(cur_kiosk.get(field, ''))
+                if str(new_k.get(field, '')) != str(db_val):
+                    val = new_k[field]
+                    set_clauses.append(f"{field} = '{val}'" if isinstance(val, str) else f"{field} = {val}")
+            if set_clauses:
+                sql_statements.append(f"UPDATE kiosk_config SET {', '.join(set_clauses)};")
+                stats['updated'] += 1
+                logger.info(f"[db_update] kiosk_config: {len(set_clauses)} field(s) changed")
+        # ================================================================
+        # Case 4.1: No changes detected
+        # ================================================================
+        if not sql_statements:
+            logger.info("[db_update] No changes detected.")
+            publish_response(client, response_topic, "db_update", "success",
+                             {"message": "No changes detected.", "stats": stats})
+            return
+        # Log all statements for audit trail
+        for i, sql in enumerate(sql_statements, 1):
+            logger.info(f"[db_update] Statement {i}:\n{sql}")
+        # Execute everything in one transaction
+        success, error = execute_sql_transaction(sql_statements)
+        if success:
+            publish_response(client, response_topic, "db_update", "success", {
+                "message": "DB updated successfully.",
+                "stats": stats,
+                "statements_executed": len(sql_statements)
+            })
+        else:
+            publish_response(client, response_topic, "db_update", "failed", {}, error)
+    except Exception as e:
+        logger.error(f"db_update failed: {e}")
+        publish_response(client, response_topic, "db_update", "failed", {}, str(e))
 def handle_db_get(client, response_topic, payload):
     """
     Reads the current DB state and publishes it back in the exact same
@@ -661,7 +1084,8 @@ ACTION_ROUTER = {
     "db_query":     handle_db_query,
     "docker_update":handle_docker_update,
     "db_setup":     handle_db_setup,
-    "db_get":       handle_db_get,         # <-- NEW
+    "db_get":       handle_db_get,
+    "db_update":    handle_db_update,      # <-- NEW
 }
 def on_message(client, userdata, msg):
     logger.info(f"Received message on {msg.topic}")
