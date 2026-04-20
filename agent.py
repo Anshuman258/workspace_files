@@ -36,7 +36,7 @@ LOGFILE = "/var/log/gmp_agent.log"
 # -------------------------------------------------------------------
 FIREBASE_BUCKET            = "gmp-pos-877ee.firebasestorage.app"
 FIREBASE_SA_KEY_PATH       = "/etc/gmp/firebase_service_account.json"
-SCHEDULE_POLL_INTERVAL     = 1 * 60          # seconds between Firebase polls (30 min)
+SCHEDULE_POLL_INTERVAL     = 30 * 60          # seconds between Firebase polls (30 min)
 MAX_LATE_EXECUTION_HOURS   = 24               # skip if scheduled_at is older than this
 LAST_SCHEDULE_STATE_FILE   = "/var/lib/gmp/last_schedule_state.json"
 # Docker restart after successful db_update
