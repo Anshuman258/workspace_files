@@ -1,8 +1,5 @@
 """
-GMP Agent — Merged MQTT listener + DB Setup + DB Update.
-Listens on gmp/device/{MAC}/command for action payloads.
-When action = "db_setup", generates SQL from the JSON and
-executes it directly against the local MySQL database.
+GMP Agent — Merged MQTT listener + DB Setup + DB Update + Garage Door + PROD + Scheduler
 """
 import os
 import sys
@@ -14,16 +11,19 @@ import subprocess
 import socket
 import platform
 import base64
+import threading
+import datetime
+import urllib.parse
 import paho.mqtt.client as mqtt
 import pymysql
 import pymysql.cursors
 # -------------------------------------------------------------------
 # Configuration
 # -------------------------------------------------------------------
-MQTT_BROKER  = "b-a7ea48df-8e78-4841-bbb3-8364bc748d37-1.mq.us-east-1.amazonaws.com"
+MQTT_BROKER  = "mqtt-gmp-qa.getmyparking.com"
 MQTT_PORT    = 8883
-MQTT_USER    = "access-analytics-mq45"
-MQTT_PASS    = "Tk7TvUZQGvf5hlV"
+MQTT_USER    = "gmp-qa-mq"
+MQTT_PASS    = "T91lx1PPdkv0ZYY"
 # MySQL — adjust DB_NAME and DB_PASS to match your environment
 DB_HOST = "localhost"
 DB_PORT = 3306
@@ -31,6 +31,21 @@ DB_USER = "root"
 DB_PASS = "root"
 DB_NAME = "access_online"       # <-- Change to your actual database name
 LOGFILE = "/var/log/gmp_agent.log"
+# -------------------------------------------------------------------
+# Scheduled DB Update — Firebase Configuration
+# -------------------------------------------------------------------
+FIREBASE_BUCKET            = "gmp-pos-877ee.firebasestorage.app"
+FIREBASE_SA_KEY_PATH       = "/etc/gmp/firebase_service_account.json"
+SCHEDULE_POLL_INTERVAL     = 1 * 60          # seconds between Firebase polls (30 min)
+MAX_LATE_EXECUTION_HOURS   = 24               # skip if scheduled_at is older than this
+LAST_SCHEDULE_STATE_FILE   = "/var/lib/gmp/last_schedule_state.json"
+# Docker restart after successful db_update
+# Set RESTART_DOCKER_ON_UPDATE = True to enable.
+# Add more container names to DOCKER_CONTAINERS as needed.
+RESTART_DOCKER_ON_UPDATE   = False
+DOCKER_CONTAINERS          = ["access-online"]  # list of containers to restart
+# Thread-safety lock — prevents simultaneous MQTT + scheduler db_update
+_db_update_lock = threading.Lock()
 # -------------------------------------------------------------------
 # Logging Setup
 # -------------------------------------------------------------------
@@ -125,16 +140,16 @@ VALUES
 def generate_online_config_sql(data: dict) -> str:
     row = data['enable_online_config']
     defaults = {
-        'default_cloud_base_url': 'https://api.parkingglobalserver.com',
-        'default_universal_secret_key': 'yyyyyyyyyyyyyyy',
-        'default_universal_hmac_username': 'gmpxxxxxxxxxx',
+        'default_cloud_base_url': 'https://qa.getmyparking.com',
+        'default_universal_secret_key': '6TXfI5mSoTj9Xds',
+        'default_universal_hmac_username': 'qa-testing',
         'default_universal_currency': 'USD',
         'default_hmac_username': 'enable',
         'default_hmac_password': 'ZW5hYmxlMTIzIQ==',
-        'default_mqtt_broker_address': 'mqtt.xxxxxxxxx',
+        'default_mqtt_broker_address': 'mqtt-gmp-qa.getmyparking.com',
         'default_mqtt_port': '8883',
-        'default_mqtt_user': 'enable',
-        'default_mqtt_password': 'xxxxxxxxxxx',
+        'default_mqtt_user': 'gmp-qa-mq',
+        'default_mqtt_password': 'T91lx1PPdkv0ZYY',
         'default_image_remove_cron_duration': 1,
         'default_image_to_be_removed_before': 47,
         'default_send_loop_data_interval': 180,
@@ -300,6 +315,57 @@ def generate_extra_configs_sql(data: dict) -> list[str]:
         f"INSERT INTO `kiosk_config` (`mqtt_broker_address`, `mqtt_port`, `mqtt_user`, `mqtt_password`, `created_at`, `updated_at`) "
         f"VALUES ('{k['mqtt_broker_address']}', '{k['mqtt_port']}', '{k['mqtt_user']}', '{k['mqtt_password']}', now(), now());"
     ]
+
+
+def generate_garage_door_sql(data: dict, existing_controller_ids: set) -> list[str]:
+    """
+    Generates SQL for GARAGE_DOOR hardware entries.
+    - For each entry in garage_door[], inserts a hardware_devices row with lane_id = NULL.
+    - If the controller_id is NOT already in existing_controller_ids (lane controllers),
+      also inserts a new enable_controllers row.
+    existing_controller_ids: set of controller_ids already inserted by generate_enable_controllers_sql.
+    Returns a list of SQL strings.
+    """
+    gd_rows = data.get('garage_door', [])
+    if not gd_rows:
+        return []
+    sqls = []
+    rest_json = '{"DOVal": [{"Ch": 0,"Md": 0,"Val": 1}]}'
+    seen_ctrl = set()
+    hw_counter_base = 9000  # GD hw IDs start high to avoid collision with lane hw
+    for i, gd in enumerate(gd_rows):
+        cid = gd['controller_id']
+        # Insert controller if not already covered by lane_controller_hardware
+        if cid not in existing_controller_ids and cid not in seen_ctrl:
+            hk = base64.b64encode(f"{gd['MQTT_user']}:{gd['MQTT_password']}".encode()).decode()
+            sqls.append(
+                f"INSERT INTO enable_controllers "
+                f"(controller_id, controller_name, header_key, ip, mqtt_port, MQTT_user, MQTT_password, "
+                f"response_type, firmware_version, controller_device_name, controller_state, "
+                f"timer_bw_pin_high_low, is_wise, created_at, updated_at, is_lane_independent_controller) "
+                f"VALUES ({cid}, 'ADAM_HIGH', '{hk}', '{gd['controller_ip']}', "
+                f"1883, '{gd['MQTT_user']}', '{gd['MQTT_password']}', 'JSON', 'A1.16 B02', "
+                f"'{gd['garage_door_name']}', 'ACTIVE', 2, 1, now(), now(), 0);"
+            )
+        seen_ctrl.add(cid)
+        # Build hardware_devices row
+        pin      = str(gd['garage_door_pin'])
+        mac      = gd['controller_mac']
+        access_url = f"Advantech/{mac}/ctl/do{pin}"
+        rest_ep  = f"http://{gd['controller_ip']}/do_value/slot_0"
+        ext_id   = str(gd['external_identifier'])
+        hw_id    = hw_counter_base + i
+        sqls.append(
+            f"INSERT INTO hardware_devices "
+            f"(hardware_device_id, connection_type, type, port, url, input_type, response_type, "
+            f"rest_endpoint, rest_request_json_high_value, device_access_url, max_connections_allowed, "
+            f"hardware_device_name, hardware_username, hardware_password, ftp_username, ftp_password, "
+            f"external_identifier, status, created_at, updated_at, controller_id, lane_id, is_stp) "
+            f"VALUES ({hw_id}, 'MQTT_SERVER', 'GARAGE_DOOR', '1883', '0.0.0.0', '{pin}', 'JSON', "
+            f"'{rest_ep}', '{rest_json}', '{access_url}', 1, '{gd['garage_door_name']}', "
+            f"'', '', '', '', '{ext_id}', 'ACTIVE', now(), now(), {cid}, NULL, 1);"
+        )
+    return sqls
 # -------------------------------------------------------------------
 # Helper Functions
 # -------------------------------------------------------------------
@@ -442,7 +508,8 @@ def handle_db_setup(client, response_topic, payload):
             "enable_online_config": { ... },
             "lane_controller_hardware": [ ... ],
             "analytics_config": { ... },
-            "kiosk_config": { ... }
+            "kiosk_config": { ... },
+            "garage_door": [ ... ]    # optional
         }
     }
     """
@@ -462,13 +529,16 @@ def handle_db_setup(client, response_topic, payload):
         return
     # --- Generate all SQL statements ---
     try:
+        # Track which controller_ids are covered by lane_controller_hardware
+        lane_ctrl_ids = {row['controller_id'] for row in db_json.get('lane_controller_hardware', [])}
         sql_statements = [
             generate_enable_config_sql(db_json),
             generate_online_config_sql(db_json),
             generate_enable_controllers_sql(db_json),
             generate_lanes_sql(db_json),
             generate_hardware_sql(db_json),
-            *generate_extra_configs_sql(db_json),   # returns a list of 2 statements
+            *generate_extra_configs_sql(db_json),
+            *generate_garage_door_sql(db_json, lane_ctrl_ids),   # optional; empty list if absent
         ]
     except KeyError as e:
         publish_response(client, response_topic, "db_setup", "failed", {},
@@ -540,6 +610,57 @@ def _expected_hw_fields(row: dict, hw_type: str) -> dict:
         'hardware_username':            'admin'  if hw_type == 'CERRADA_LPR' else '',
         'hardware_password':            'secret' if hw_type == 'CERRADA_LPR' else '',
     }
+
+
+def _expected_gd_fields(gd: dict) -> dict:
+    """
+    Returns the expected DB field values for a GARAGE_DOOR hardware row.
+    Used for diffing in db_update.
+    """
+    pin        = str(gd['garage_door_pin'])
+    access_url = f"Advantech/{gd['controller_mac']}/ctl/do{pin}"
+    rest_ep    = f"http://{gd['controller_ip']}/do_value/slot_0"
+    return {
+        'hardware_device_name':         gd['garage_door_name'],
+        'input_type':                   pin,
+        'device_access_url':            access_url,
+        'rest_endpoint':                rest_ep,
+        'rest_request_json_high_value': '{"DOVal": [{"Ch": 0,"Md": 0,"Val": 1}]}',
+        'external_identifier':          str(gd['external_identifier']),
+    }
+
+
+def _build_gd_insert_sql(hw_id: int, gd: dict) -> str:
+    """Generates a single INSERT INTO hardware_devices statement for a GARAGE_DOOR."""
+    f   = _expected_gd_fields(gd)
+    cid = gd['controller_id']
+    return (
+        f"INSERT INTO hardware_devices "
+        f"(hardware_device_id, connection_type, type, port, url, input_type, response_type, "
+        f"rest_endpoint, rest_request_json_high_value, device_access_url, max_connections_allowed, "
+        f"hardware_device_name, hardware_username, hardware_password, ftp_username, ftp_password, "
+        f"external_identifier, status, created_at, updated_at, controller_id, lane_id, is_stp) "
+        f"VALUES ({hw_id}, 'MQTT_SERVER', 'GARAGE_DOOR', '1883', '0.0.0.0', '{f['input_type']}', 'JSON', "
+        f"'{f['rest_endpoint']}', '{f['rest_request_json_high_value']}', '{f['device_access_url']}', "
+        f"1, '{f['hardware_device_name']}', '', '', '', '', '{f['external_identifier']}', "
+        f"'ACTIVE', now(), now(), {cid}, NULL, 1);"
+    )
+
+
+def _build_ctrl_insert_sql(cid: int, ip: str, mqtt_user: str, mqtt_pass: str,
+                           device_name: str) -> str:
+    """Generates an INSERT INTO enable_controllers for a GARAGE_DOOR-only controller."""
+    hk = base64.b64encode(f"{mqtt_user}:{mqtt_pass}".encode()).decode()
+    return (
+        f"INSERT INTO enable_controllers "
+        f"(controller_id, controller_name, header_key, ip, mqtt_port, MQTT_user, MQTT_password, "
+        f"response_type, firmware_version, controller_device_name, controller_state, "
+        f"timer_bw_pin_high_low, is_wise, created_at, updated_at, is_lane_independent_controller) "
+        f"VALUES ({cid}, 'ADAM_HIGH', '{hk}', '{ip}', 1883, '{mqtt_user}', '{mqtt_pass}', "
+        f"'JSON', 'A1.16 B02', '{device_name}', 'ACTIVE', 2, 1, now(), now(), 0);"
+    )
+
+
 def _build_hw_insert_sql(hw_id: int, hw_type: str, row: dict, lane_id: int) -> str:
     """Generates a single INSERT INTO hardware_devices statement."""
     f = _expected_hw_fields(row, hw_type)
@@ -634,17 +755,29 @@ def handle_db_update(client, response_topic, payload):
             # Lane keyed by cloud_lane_id for diffing, also keep id (= controller_id used as lane pk)
             cursor.execute("SELECT * FROM lanes")
             cur_lanes = {row['cloud_lane_id']: row for row in cursor.fetchall()}
-            # Hardware keyed by lane_id → type
-            cursor.execute("SELECT * FROM hardware_devices ORDER BY hardware_device_id")
+            # Hardware keyed by lane_id → type (lane-linked hw only)
+            cursor.execute(
+                "SELECT * FROM hardware_devices WHERE lane_id IS NOT NULL ORDER BY hardware_device_id"
+            )
             cur_hw_by_lane = {}
             for hw in cursor.fetchall():
                 cur_hw_by_lane.setdefault(hw['lane_id'], {})[hw['type']] = hw
+            # GARAGE_DOOR hardware keyed by external_identifier (lane_id IS NULL)
+            cursor.execute(
+                "SELECT * FROM hardware_devices WHERE type = 'GARAGE_DOOR' ORDER BY hardware_device_id"
+            )
+            cur_gd = {str(hw['external_identifier']): hw for hw in cursor.fetchall()}
             cursor.execute("SELECT * FROM analytics_config LIMIT 1")
             cur_analytics = cursor.fetchone()
             cursor.execute("SELECT * FROM kiosk_config LIMIT 1")
             cur_kiosk = cursor.fetchone()
             cursor.execute("SELECT COALESCE(MAX(hardware_device_id), 0) as max_id FROM hardware_devices")
             hw_id_counter = cursor.fetchone()['max_id'] + 1
+            # Lane id counter — prevents PK conflict when lanes are reassigned
+            # across controllers and new lanes are added to the same controller.
+            # db_setup uses controller_id as lane id, so max(id) is always safe.
+            cursor.execute("SELECT COALESCE(MAX(id), 0) as max_id FROM lanes")
+            lane_id_counter = cursor.fetchone()['max_id'] + 1
         conn.close()
         # ================================================================
         # 1. enable_online_config → enable_config (single row)
@@ -749,7 +882,11 @@ def handle_db_update(client, response_topic, payload):
             for clid in new_lane_ids - cur_lane_ids:
                 row    = new_lanes[clid]
                 prefix = f"{row['lane_type']}_{clid}"
-                lane_id = row['controller_id']
+                # Use lane_id_counter instead of controller_id to avoid PK conflicts
+                # when a lane is reassigned (old lane keeps the old id) and a new
+                # lane is inserted on the same controller.
+                lane_id = lane_id_counter
+                lane_id_counter += 1
                 sql_statements.append(
                     f"INSERT INTO lanes "
                     f"(id, cloud_lane_id, vehicle_type, prefix, loop_logic, loop1_interval, loop2_interval, "
@@ -766,7 +903,7 @@ def handle_db_update(client, response_topic, payload):
                     f"0, NULL, 30, 5);"
                 )
                 stats['inserted'] += 1
-                logger.info(f"[db_update] INSERT lane cloud_lane_id={clid}")
+                logger.info(f"[db_update] INSERT lane cloud_lane_id={clid} id={lane_id}")
                 for hw_type in [h.strip() for h in row['hardware_type'].split(',')]:
                     sql_statements.append(_build_hw_insert_sql(hw_id_counter, hw_type, row, lane_id))
                     hw_id_counter += 1
@@ -856,10 +993,9 @@ def handle_db_update(client, response_topic, payload):
                 stats['deleted'] += 2
                 logger.info(f"[db_update] DELETE lane cloud_lane_id={clid} (and its hw)")
             # ---- DELETE removed controllers (after their lanes are gone) ----
-            for cid in cur_ctrl_ids - new_ctrl_ids:
-                sql_statements.append(f"DELETE FROM enable_controllers WHERE controller_id = {cid};")
-                stats['deleted'] += 1
-                logger.info(f"[db_update] DELETE controller_id={cid}")
+            # A controller is only deleted if it's absent from BOTH lane_controller_hardware
+            # AND garage_door[] — handled after section 5 so new_gd_ctrl_ids is available
+            _pending_ctrl_deletes = cur_ctrl_ids - new_ctrl_ids
         # ================================================================
         # 3. analytics_config — single row UPDATE
         # ================================================================
@@ -891,6 +1027,87 @@ def handle_db_update(client, response_topic, payload):
                 stats['updated'] += 1
                 logger.info(f"[db_update] kiosk_config: {len(set_clauses)} field(s) changed")
         # ================================================================
+        # 5. garage_door — diff by external_identifier, lane_id = NULL
+        # ================================================================
+        new_gd_ctrl_ids = set()   # controller_ids referenced by incoming garage_door[]
+        if 'garage_door' in db_json:
+            new_gd_rows = db_json['garage_door']
+            new_gd = {str(gd['external_identifier']): gd for gd in new_gd_rows}
+            cur_gd_ids = set(cur_gd.keys())
+            new_gd_ids = set(new_gd.keys())
+            new_gd_ctrl_ids = {gd['controller_id'] for gd in new_gd_rows}
+
+            # ---- INSERT new GARAGE_DOORs ----
+            for ext_id in new_gd_ids - cur_gd_ids:
+                gd = new_gd[ext_id]
+                cid = gd['controller_id']
+                # Insert controller if it doesn't exist (not from lane section either)
+                if cid not in cur_controllers and cid not in {r['controller_id'] for r in
+                        db_json.get('lane_controller_hardware', [])
+                        if r['controller_id'] == cid}:
+                    # Only insert if truly new
+                    if cid not in cur_controllers:
+                        sql_statements.append(_build_ctrl_insert_sql(
+                            cid, gd['controller_ip'],
+                            gd['MQTT_user'], gd['MQTT_password'],
+                            gd['garage_door_name']
+                        ))
+                        stats['inserted'] += 1
+                        logger.info(f"[db_update] INSERT GD controller_id={cid}")
+                sql_statements.append(_build_gd_insert_sql(hw_id_counter, gd))
+                hw_id_counter += 1
+                stats['inserted'] += 1
+                logger.info(f"[db_update] INSERT GARAGE_DOOR ext_id={ext_id}")
+
+            # ---- UPDATE existing GARAGE_DOORs ----
+            for ext_id in cur_gd_ids & new_gd_ids:
+                gd       = new_gd[ext_id]
+                cur_row  = cur_gd[ext_id]
+                expected = _expected_gd_fields(gd)
+                hw_set   = []
+                for db_col, new_val in expected.items():
+                    db_val = _normalize_db_val(cur_row.get(db_col, ''))
+                    if str(new_val) != str(db_val):
+                        hw_set.append(f"{db_col} = '{new_val}'")
+                # Also check controller_id change
+                if gd['controller_id'] != cur_row.get('controller_id'):
+                    hw_set.append(f"controller_id = {gd['controller_id']}")
+                if hw_set:
+                    hw_set.append("updated_at = now()")
+                    sql_statements.append(
+                        f"UPDATE hardware_devices SET {', '.join(hw_set)} "
+                        f"WHERE type = 'GARAGE_DOOR' AND external_identifier = '{ext_id}';"
+                    )
+                    stats['updated'] += 1
+                    logger.info(f"[db_update] UPDATE GARAGE_DOOR ext_id={ext_id}: {hw_set}")
+
+            # ---- DELETE removed GARAGE_DOORs ----
+            for ext_id in cur_gd_ids - new_gd_ids:
+                sql_statements.append(
+                    f"DELETE FROM hardware_devices WHERE type = 'GARAGE_DOOR' "
+                    f"AND external_identifier = '{ext_id}';"
+                )
+                stats['deleted'] += 1
+                logger.info(f"[db_update] DELETE GARAGE_DOOR ext_id={ext_id}")
+
+        # ================================================================
+        # Controller deletion — only if absent from both lane AND garage_door
+        # ================================================================
+        if 'lane_controller_hardware' in db_json:
+            for cid in _pending_ctrl_deletes:
+                if cid not in new_gd_ctrl_ids:
+                    # Also delete any GD hw on this controller before removing controller
+                    sql_statements.append(
+                        f"DELETE FROM hardware_devices "
+                        f"WHERE controller_id = {cid} AND type = 'GARAGE_DOOR';"
+                    )
+                    sql_statements.append(
+                        f"DELETE FROM enable_controllers WHERE controller_id = {cid};"
+                    )
+                    stats['deleted'] += 1
+                    logger.info(f"[db_update] DELETE controller_id={cid}")
+
+        # ================================================================
         # Case 4.1: No changes detected
         # ================================================================
         if not sql_statements:
@@ -909,6 +1126,7 @@ def handle_db_update(client, response_topic, payload):
                 "stats": stats,
                 "statements_executed": len(sql_statements)
             })
+            _restart_docker_if_enabled()
         else:
             publish_response(client, response_topic, "db_update", "failed", {}, error)
     except Exception as e:
@@ -958,22 +1176,29 @@ def handle_db_get(client, response_topic, payload):
                 "controller_id FROM lanes"
             )
             lanes = cursor.fetchall()
-            # 4. hardware_devices — grouped by lane_id
+            # 4. hardware_devices — grouped by lane_id (lane-linked only)
             cursor.execute(
                 "SELECT lane_id, type, input_type, device_access_url "
-                "FROM hardware_devices ORDER BY hardware_device_id"
+                "FROM hardware_devices WHERE lane_id IS NOT NULL ORDER BY hardware_device_id"
             )
             hw_by_lane = {}
             for hw in cursor.fetchall():
                 lid = hw['lane_id']
                 hw_by_lane.setdefault(lid, []).append(hw)
-            # 5. analytics_config
+            # 5. garage_door hardware (lane_id IS NULL)
+            cursor.execute(
+                "SELECT controller_id, input_type, device_access_url, hardware_device_name, "
+                "external_identifier, rest_endpoint "
+                "FROM hardware_devices WHERE type = 'GARAGE_DOOR' ORDER BY hardware_device_id"
+            )
+            gd_rows_db = cursor.fetchall()
+            # 6. analytics_config
             cursor.execute(
                 "SELECT mqtt_broker_address, mqtt_port, mqtt_user, mqtt_password "
                 "FROM analytics_config LIMIT 1"
             )
             analytics = cursor.fetchone()
-            # 6. kiosk_config
+            # 7. kiosk_config
             cursor.execute(
                 "SELECT mqtt_broker_address, mqtt_port, mqtt_user, mqtt_password "
                 "FROM kiosk_config LIMIT 1"
@@ -1030,6 +1255,26 @@ def handle_db_get(client, response_topic, payload):
                 "boombarrier_sensor_pin": boombarrier_sensor_pin,
                 "boom_barrier_pin":       boom_barrier_pin,
             })
+        # --- Reconstruct garage_door[] ---
+        garage_door = []
+        for gd in gd_rows_db:
+            ctrl = controllers.get(gd['controller_id'], {})
+            # Recover controller_mac from device_access_url: "Advantech/{mac}/ctl/do{pin}"
+            try:
+                ctrl_mac = gd['device_access_url'].split('/')[1]
+            except (IndexError, AttributeError):
+                ctrl_mac = ''
+            garage_door.append({
+                "controller_id":       gd['controller_id'],
+                "controller_ip":       ctrl.get('ip', ''),
+                "controller_mac":      ctrl_mac,
+                "MQTT_user":           ctrl.get('MQTT_user', ''),
+                "MQTT_password":       ctrl.get('MQTT_password', ''),
+                "garage_door_name":    gd['hardware_device_name'],
+                "garage_door_pin":     gd['input_type'],
+                "external_identifier": gd['external_identifier'],
+            })
+
         # --- Build final payload ---
         result = {
             "enable_online_config": {
@@ -1041,7 +1286,7 @@ def handle_db_get(client, response_topic, payload):
                 "parking_name":                   ec['parking_name'],
                 "nuc_device_name":                ec['nuc_device_name'],
                 "timezone":                       ec['timezone'],
-                "geohash":                        ec['geo_hash'],          # DB col is geo_hash
+                "geohash":                        ec['geo_hash'],
                 "country_code":                   ec['country_code'],
                 "parking_system_name":            ec['parking_system_name'],
                 "attach_not_found_lpr":           ec['attach_not_found_lpr'],
@@ -1055,6 +1300,7 @@ def handle_db_get(client, response_topic, payload):
                 "tag_lp_to_image_enabled":        ec['tag_lp_to_image_enabled'],
             },
             "lane_controller_hardware": lane_controller_hardware,
+            "garage_door":             garage_door,
             "analytics_config": {
                 "mqtt_broker_address": analytics['mqtt_broker_address'],
                 "mqtt_port":           analytics['mqtt_port'],
@@ -1074,6 +1320,185 @@ def handle_db_get(client, response_topic, payload):
     except Exception as e:
         logger.error(f"db_get failed: {e}")
         publish_response(client, response_topic, "db_get", "failed", {}, str(e))
+# -------------------------------------------------------------------
+# Scheduled DB Update — Firebase Polling
+# -------------------------------------------------------------------
+
+def _restart_docker_if_enabled():
+    """Restarts Docker containers listed in DOCKER_CONTAINERS if flag is enabled."""
+    if not RESTART_DOCKER_ON_UPDATE:
+        return
+    for container in DOCKER_CONTAINERS:
+        try:
+            logger.info(f"[scheduler] Restarting Docker container: {container}")
+            subprocess.run(["docker", "restart", container], check=True, timeout=30)
+            logger.info(f"[scheduler] Container '{container}' restarted successfully.")
+        except subprocess.CalledProcessError as e:
+            logger.error(f"[scheduler] Failed to restart container '{container}': {e}")
+        except subprocess.TimeoutExpired:
+            logger.error(f"[scheduler] Timeout restarting container '{container}'")
+
+
+def _get_db_schedule_params():
+    """
+    Reads tenant_name and cloud_parking_id from enable_config.
+    Returns (tenant_name, cloud_parking_id, mac_with_colons) or None if DB not ready.
+    """
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT tenant_name, cloud_parking_id FROM enable_config LIMIT 1")
+            row = cursor.fetchone()
+        conn.close()
+        if not row:
+            logger.warning("[scheduler] enable_config is empty — skipping schedule check.")
+            return None
+        mac = get_mac_address(strip_colons=False)   # e.g. 1c:69:7a:a6:9f:15
+        return row['tenant_name'], row['cloud_parking_id'], mac
+    except Exception as e:
+        logger.error(f"[scheduler] Failed to read DB schedule params: {e}")
+        return None
+
+
+def _fetch_firebase_schedule_json(tenant, parking_id, mac):
+    """
+    Fetches the scheduled db.json from Firebase Storage using the Admin SDK.
+    Returns parsed dict or None on any error.
+    """
+    try:
+        import firebase_admin
+        from firebase_admin import credentials, storage as fb_storage
+
+        # Initialise app only once
+        if not firebase_admin._apps:
+            cred = credentials.Certificate(FIREBASE_SA_KEY_PATH)
+            firebase_admin.initialize_app(cred, {'storageBucket': FIREBASE_BUCKET})
+
+        bucket  = fb_storage.bucket()
+        path    = f"nucConfigs/{tenant}/{parking_id}/{mac}/db.json"
+        blob    = bucket.blob(path)
+
+        if not blob.exists():
+            logger.info(f"[scheduler] No schedule file found at '{path}'.")
+            return None
+
+        content = blob.download_as_text()
+        return json.loads(content)
+    except FileNotFoundError:
+        logger.error(f"[scheduler] Service account key not found: {FIREBASE_SA_KEY_PATH}")
+        return None
+    except Exception as e:
+        logger.error(f"[scheduler] Firebase fetch error: {e}")
+        return None
+
+
+def _read_last_schedule_state():
+    """Returns the last executed scheduled_at string, or None if never executed."""
+    try:
+        with open(LAST_SCHEDULE_STATE_FILE, 'r') as f:
+            return json.load(f).get('last_executed_scheduled_at')
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def _write_last_schedule_state(scheduled_at_str):
+    """Persists the last executed scheduled_at to disk."""
+    try:
+        os.makedirs(os.path.dirname(LAST_SCHEDULE_STATE_FILE), exist_ok=True)
+        with open(LAST_SCHEDULE_STATE_FILE, 'w') as f:
+            json.dump({'last_executed_scheduled_at': scheduled_at_str}, f)
+    except Exception as e:
+        logger.error(f"[scheduler] Failed to write schedule state: {e}")
+
+
+def _should_execute_schedule(scheduled_at_str, last_executed_str):
+    """
+    Returns (should_execute: bool, reason: str).
+    Decision table:
+      - scheduled_at == last_executed  → skip (already ran)
+      - scheduled_at > now (UTC)       → skip (future)
+      - now - scheduled_at > MAX_LATE  → skip (too old)
+      - otherwise                      → execute
+    """
+    if scheduled_at_str == last_executed_str:
+        return False, "already executed"
+    try:
+        scheduled_at = datetime.datetime.fromisoformat(
+            scheduled_at_str.replace('Z', '+00:00')
+        )
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        if scheduled_at > now_utc:
+            return False, f"scheduled for {scheduled_at_str} (future)"
+        age_hours = (now_utc - scheduled_at).total_seconds() / 3600
+        if age_hours > MAX_LATE_EXECUTION_HOURS:
+            return False, f"too old ({age_hours:.1f}h > {MAX_LATE_EXECUTION_HOURS}h limit)"
+        return True, f"ready (scheduled={scheduled_at_str}, age={age_hours:.1f}h)"
+    except (ValueError, TypeError) as e:
+        return False, f"invalid scheduled_at format: {e}"
+
+
+def _run_scheduled_db_update(schedule_json, scheduled_at_str):
+    """
+    Executes a db_update directly from the scheduler (no MQTT client/topic needed).
+    Uses a no-op client stub so handle_db_update can publish responses without error.
+    """
+    class _NullClient:
+        """Stub MQTT client — discards all publish calls from handle_db_update."""
+        def publish(self, *args, **kwargs): pass
+
+    logger.info(f"[scheduler] Executing scheduled db_update for scheduled_at={scheduled_at_str}")
+    with _db_update_lock:
+        handle_db_update(_NullClient(), "__scheduler__", schedule_json)
+    logger.info(f"[scheduler] Scheduled db_update completed for scheduled_at={scheduled_at_str}")
+    _write_last_schedule_state(scheduled_at_str)
+    _restart_docker_if_enabled()
+
+
+def check_and_apply_scheduled_update():
+    """Main scheduler logic — called every SCHEDULE_POLL_INTERVAL seconds."""
+    logger.debug("[scheduler] Checking Firebase for scheduled update...")
+
+    params = _get_db_schedule_params()
+    if not params:
+        return
+    tenant, parking_id, mac = params
+
+    schedule_json = _fetch_firebase_schedule_json(tenant, parking_id, mac)
+    if not schedule_json:
+        return
+
+    # Validate payload structure
+    if schedule_json.get('action') != 'db_update':
+        logger.warning("[scheduler] Firebase JSON action is not 'db_update' — skipping.")
+        return
+    if 'data' not in schedule_json:
+        logger.warning("[scheduler] Firebase JSON missing 'data' key — skipping.")
+        return
+    scheduled_at_str = schedule_json.get('scheduled_at')
+    if not scheduled_at_str:
+        logger.warning("[scheduler] Firebase JSON missing 'scheduled_at' — skipping.")
+        return
+
+    last_executed = _read_last_schedule_state()
+    should_run, reason = _should_execute_schedule(scheduled_at_str, last_executed)
+    logger.info(f"[scheduler] scheduled_at={scheduled_at_str} | {('EXECUTE' if should_run else 'SKIP')}: {reason}")
+
+    if should_run:
+        _run_scheduled_db_update(schedule_json, scheduled_at_str)
+
+
+def scheduled_update_loop():
+    """Background daemon thread — polls Firebase every SCHEDULE_POLL_INTERVAL seconds."""
+    logger.info(f"[scheduler] Started. Poll interval: {SCHEDULE_POLL_INTERVAL}s "
+                f"| Max late execution: {MAX_LATE_EXECUTION_HOURS}h")
+    while True:
+        try:
+            check_and_apply_scheduled_update()
+        except Exception as e:
+            logger.error(f"[scheduler] Unexpected error in scheduler loop: {e}")
+        time.sleep(SCHEDULE_POLL_INTERVAL)
+
+
 # -------------------------------------------------------------------
 # The Command Router
 # -------------------------------------------------------------------
@@ -1107,20 +1532,49 @@ def on_message(client, userdata, msg):
 # Main Service Loop
 # -------------------------------------------------------------------
 def on_connect(client, userdata, flags, rc):
+    RC_CODES = {0: "Success", 1: "Bad protocol", 2: "Client ID rejected",
+                3: "Server unavailable", 4: "Bad credentials", 5: "Not authorized"}
     if rc == 0:
         logger.info(f"Connected to MQTT Broker. Subscribing to: {userdata['command_topic']}")
         client.subscribe(userdata['command_topic'])
+    else:
+        logger.error(f"MQTT connection refused: rc={rc} ({RC_CODES.get(rc, 'Unknown')})")
+
+def on_disconnect(client, userdata, rc):
+    if rc == 0:
+        logger.info("Disconnected cleanly from MQTT Broker.")
+    else:
+        logger.warning(f"Unexpected MQTT disconnect (rc={rc}). Will auto-reconnect...")
+
 if __name__ == "__main__":
     logger.info("Starting GMP Agent Service...")
     signal.signal(signal.SIGINT,  lambda s, f: sys.exit(0))
     signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
+
+    # Kill any other running agent instances to prevent client_id conflicts
+    my_pid = os.getpid()
+    try:
+        import subprocess as _sp
+        result = _sp.run(
+            ["pgrep", "-f", "mqtt_v[0-9]+\\.py|gmp_agent\\.py"],
+            capture_output=True, text=True
+        )
+        for pid_str in result.stdout.strip().split('\n'):
+            if pid_str and int(pid_str) != my_pid:
+                logger.warning(f"Killing stale agent process PID={pid_str}")
+                os.kill(int(pid_str), signal.SIGTERM)
+                time.sleep(1)
+    except Exception:
+        pass
+
     DEVICE_MAC_ID  = get_mac_address(strip_colons=True)
     COMMAND_TOPIC  = f"gmp/device/{DEVICE_MAC_ID}/command"
     RESPONSE_TOPIC = f"gmp/device/{DEVICE_MAC_ID}/response"
-    logger.info(f"Agent ID: {DEVICE_MAC_ID}")
+    logger.info(f"Agent ID: {DEVICE_MAC_ID} | PID: {my_pid}")
+
     client = mqtt.Client(
         client_id=f"gmp_agent_{DEVICE_MAC_ID}",
-        clean_session=False,
+        clean_session=True,
         userdata={
             "command_topic":  COMMAND_TOPIC,
             "response_topic": RESPONSE_TOPIC
@@ -1128,10 +1582,22 @@ if __name__ == "__main__":
     )
     client.username_pw_set(MQTT_USER, MQTT_PASS)
     client.tls_set()
-    client.on_connect = on_connect
-    client.on_message = on_message
+    client.on_connect    = on_connect
+    client.on_disconnect = on_disconnect
+    client.on_message    = on_message
+
+    # Prevent rapid reconnection loops (min 5s, max 30s between retries)
+    client.reconnect_delay_set(min_delay=5, max_delay=30)
+
     try:
         client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
+
+        # Start Firebase scheduled update background thread
+        sched_thread = threading.Thread(target=scheduled_update_loop, daemon=True,
+                                        name="scheduler")
+        sched_thread.start()
+        logger.info("[scheduler] Background thread started.")
+
         client.loop_forever()
     except Exception as e:
         logger.critical(f"Fatal error: {e}")
