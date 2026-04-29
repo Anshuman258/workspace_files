@@ -20,10 +20,10 @@ import pymysql.cursors
 # -------------------------------------------------------------------
 # Configuration
 # -------------------------------------------------------------------
-MQTT_BROKER  = "mqtt-gmp-qa.getmyparking.com"
+MQTT_BROKER  = "b-a7ea48df-8e78-4841-bbb3-8364bc748d37-1.mq.us-east-1.amazonaws.com"
 MQTT_PORT    = 8883
-MQTT_USER    = "gmp-qa-mq"
-MQTT_PASS    = "T91lx1PPdkv0ZYY"
+MQTT_USER    = "access-analytics-mq45"
+MQTT_PASS    = "Tk7TvUZQGvf5hlV"
 # MySQL — adjust DB_NAME and DB_PASS to match your environment
 DB_HOST = "localhost"
 DB_PORT = 3306
@@ -140,16 +140,16 @@ VALUES
 def generate_online_config_sql(data: dict) -> str:
     row = data['enable_online_config']
     defaults = {
-        'default_cloud_base_url': 'https://qa.getmyparking.com',
-        'default_universal_secret_key': '6TXfI5mSoTj9Xds',
-        'default_universal_hmac_username': 'qa-testing',
+        'default_cloud_base_url': 'https://api.parkingglobalserver.com',
+        'default_universal_secret_key': 'YkYxf6znXrx4zrSP',
+        'default_universal_hmac_username': 'gmpiot',
         'default_universal_currency': 'USD',
         'default_hmac_username': 'enable',
         'default_hmac_password': 'ZW5hYmxlMTIzIQ==',
-        'default_mqtt_broker_address': 'mqtt-gmp-qa.getmyparking.com',
+        'default_mqtt_broker_address': 'mqtt.parkingglobalserver.com',
         'default_mqtt_port': '8883',
-        'default_mqtt_user': 'gmp-qa-mq',
-        'default_mqtt_password': 'T91lx1PPdkv0ZYY',
+        'default_mqtt_user': 'enable',
+        'default_mqtt_password': 'pabMQpMQ1zkjGMK7',
         'default_image_remove_cron_duration': 1,
         'default_image_to_be_removed_before': 47,
         'default_send_loop_data_interval': 180,
